@@ -4,7 +4,7 @@ Study project (sales reconciliation). Python API and .NET worker are built again
 
 ## Layout
 ```
-docker-compose.yml        db, seed (one-shot), api, worker
+docker-compose.yml        db, seed (one-shot), api, worker, ui
 .env.example              never commit .env
 db/init/001_schema.sql    mounted into /docker-entrypoint-initdb.d
 data/catalog.csv          generated once, committed (~200 rows)
@@ -12,6 +12,7 @@ data/sales.csv            generated once, committed (~1000 rows)
 data/golden.csv           ~50 labelled pairs, committed
 api/                      Python 3.12, uv, package `reconlens`, FastAPI
 worker/                   .NET 10 Worker Service + worker tests
+ui/                       Vite + React + TypeScript management UI (nginx in compose, port 5173)
 databricks/               optional: Delta DDL + MERGE notes
 .github/workflows/ci.yml
 ```
@@ -103,6 +104,16 @@ CREATE TABLE reconciliation_report (
   matches every `sales_lines` row of the batch, upserts `match_results`, returns
   `{"batch_id": str, "lines": int, "matched": int, "unmatched": int, "embedding_model": str, "threshold": float}`.
   Same key again → stored response replayed from `api_idempotency`, no re-work. 404 if the batch has no lines.
+
+Read-only endpoints for the UI (no money computed in Python; report numbers come from `reconciliation_report`, written by the worker):
+- `GET /batches` → `[{"batch_id", "line_count", "matched", "unmatched", "run_status": str | null}]` (`run_status` from the latest `reconciliation_runs` row).
+- `GET /reports/{batch_id}` → `reconciliation_report` rows for the batch (`[]` when the worker has not run it).
+- `GET /lines/{batch_id}?status=all|matched|unmatched&store_cnpj=&limit=50&offset=0` →
+  `{"total", "limit", "offset", "threshold", "items": [{"id","source_line_id","store_cnpj","sale_date","raw_product","quantity","amount","sku","name","unit_price","expected_amount","score","method"}]}`;
+  catalog/match fields are null for unmatched lines. `expected_amount` = `quantity * catalog.unit_price` read in SQL, display only (the worker's report is the source of truth). `limit` 1..500.
+- `GET /catalog?q=&limit=50` → `[{"id","sku","name","brand","ean","unit_price","active","embedding_model"}]`, no embeddings; `q` is an ILIKE on name, sku and brand.
+
+The UI calls everything under `/api` (Vite dev proxy and nginx strip the prefix and forward to the API).
 
 Hybrid query: (1) if the text contains a 13-digit EAN equal to `catalog.ean` → score 1.0, method `ean_exact`;
 (2) else cosine `1 - (embedding <=> :q)` with exact filters `active = true AND embedding_model = :current_model`

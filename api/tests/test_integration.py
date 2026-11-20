@@ -69,3 +69,47 @@ def test_reconcile_idempotency_replay(client):
 
 def test_reconcile_unknown_batch_404(client):
     assert client.post("/reconcile/no-such-batch").status_code == 404
+
+
+def test_catalog_search_and_limit(client):
+    row = CATALOG[0]
+    body = client.get("/catalog", params={"q": row["sku"].lower(), "limit": 5}).json()
+    assert [r["sku"] for r in body] == [row["sku"]]
+    assert "embedding" not in body[0]
+    assert len(client.get("/catalog", params={"limit": 3}).json()) == 3
+
+
+def test_batches_lines_and_reports(client):
+    import psycopg
+
+    batch = f"pytest-{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        for i, raw in enumerate([CATALOG[0]["name"], "ZZZ NOT A PRODUCT QQQ"]):
+            conn.execute("INSERT INTO sales_lines (batch_id, source_line_id, store_cnpj, sale_date, raw_product, "
+                         "quantity, amount) VALUES (%s, %s, '12345678000190', '2026-11-10', %s, 2, 10.00)",
+                         (batch, f"L{i}", raw))
+    assert client.post(f"/reconcile/{batch}").json()["lines"] == 2
+
+    listed = {b["batch_id"]: b for b in client.get("/batches").json()}
+    assert listed[batch]["line_count"] == 2
+    assert listed[batch]["matched"] + listed[batch]["unmatched"] == 2
+    assert listed[batch]["run_status"] is None  # only the worker writes reconciliation_runs
+
+    everything = client.get(f"/lines/{batch}").json()
+    assert everything["total"] == 2 and everything["threshold"] > 0
+    matched = client.get(f"/lines/{batch}", params={"status": "matched"}).json()["items"]
+    assert [m["sku"] for m in matched] == [CATALOG[0]["sku"]]
+    assert float(matched[0]["expected_amount"]) == float(matched[0]["unit_price"]) * 2
+    unmatched = client.get(f"/lines/{batch}", params={"status": "unmatched"}).json()["items"]
+    assert len(unmatched) == 1 and unmatched[0]["sku"] is None
+    assert client.get(f"/lines/{batch}", params={"store_cnpj": "000"}).json()["total"] == 0
+    page = client.get(f"/lines/{batch}", params={"limit": 1, "offset": 1}).json()
+    assert page["total"] == 2 and len(page["items"]) == 1
+    assert client.get(f"/lines/{batch}", params={"status": "bogus"}).status_code == 422
+
+    assert client.get(f"/reports/{batch}").json() == []
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        conn.execute("INSERT INTO reconciliation_report VALUES (%s, '12345678000190', 2, 1, 20, 10, 10, 10, 0, 0)",
+                     (batch,))
+    rep = client.get(f"/reports/{batch}").json()
+    assert len(rep) == 1 and rep[0]["store_cnpj"] == "12345678000190" and float(rep[0]["reported_total"]) == 20

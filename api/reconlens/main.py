@@ -1,8 +1,10 @@
 import json
 from functools import lru_cache
+from typing import Literal
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
+from psycopg.rows import dict_row
 from pydantic import BaseModel
 
 from reconlens import config, db, matching
@@ -72,3 +74,54 @@ def reconcile(batch_id: str, idempotency_key: str | None = Header(default=None))
                          "ON CONFLICT DO NOTHING", (idempotency_key, json.dumps(result)))
         conn.commit()
         return result
+
+
+# ---- read-only endpoints for the UI. Money numbers come from reconciliation_report (written by the worker). ----
+
+def _rows(sql: str, params: tuple | list = ()) -> list[dict]:
+    with db.connect() as conn:
+        return conn.cursor(row_factory=dict_row).execute(sql, params).fetchall()
+
+
+@app.get("/batches")
+def batches():
+    return _rows(
+        """SELECT s.batch_id, count(*) AS line_count,
+                  count(m.catalog_id) AS matched, count(*) - count(m.catalog_id) AS unmatched,
+                  (SELECT r.status FROM reconciliation_runs r WHERE r.batch_id = s.batch_id
+                   ORDER BY r.started_at DESC LIMIT 1) AS run_status
+           FROM sales_lines s LEFT JOIN match_results m ON m.sales_line_id = s.id
+           GROUP BY s.batch_id ORDER BY s.batch_id""")
+
+
+@app.get("/reports/{batch_id}")
+def report(batch_id: str):
+    return _rows("SELECT * FROM reconciliation_report WHERE batch_id = %s ORDER BY store_cnpj", (batch_id,))
+
+
+@app.get("/lines/{batch_id}")
+def lines(batch_id: str, status: Literal["all", "matched", "unmatched"] = "all", store_cnpj: str | None = None,
+          limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
+    where, params = ["s.batch_id = %s"], [batch_id]
+    if status != "all":
+        where.append("m.catalog_id IS NOT NULL" if status == "matched" else "m.catalog_id IS NULL")
+    if store_cnpj:
+        where.append("s.store_cnpj = %s")
+        params.append(store_cnpj)
+    cond = " AND ".join(where)
+    frm = ("FROM sales_lines s LEFT JOIN match_results m ON m.sales_line_id = s.id "
+           "LEFT JOIN catalog c ON c.id = m.catalog_id WHERE " + cond)
+    items = _rows(
+        "SELECT s.id, s.source_line_id, s.store_cnpj, s.sale_date, s.raw_product, s.quantity, s.amount, "
+        "c.sku, c.name, c.unit_price, c.unit_price * s.quantity AS expected_amount, m.score, m.method " + frm +
+        " ORDER BY s.id LIMIT %s OFFSET %s", [*params, limit, offset])
+    total = _rows("SELECT count(*) AS n " + frm, params)[0]["n"]
+    return {"total": total, "limit": limit, "offset": offset, "threshold": config.match_threshold(), "items": items}
+
+
+@app.get("/catalog")
+def catalog(q: str = "", limit: int = Query(50, ge=1, le=500)):
+    like = f"%{q}%"
+    return _rows("SELECT id, sku, name, brand, ean, unit_price, active, embedding_model FROM catalog "
+                 "WHERE name ILIKE %s OR sku ILIKE %s OR brand ILIKE %s ORDER BY sku LIMIT %s",
+                 (like, like, like, limit))
