@@ -1,0 +1,77 @@
+# Works with no .env file: every value has a default. Copy .env.example to .env to override.
+x-azure-env: &azure-env
+  AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+  AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+  AZURE_OPENAI_EMBEDDING_DEPLOYMENT: ${AZURE_OPENAI_EMBEDDING_DEPLOYMENT:-}
+  AZURE_OPENAI_CHAT_DEPLOYMENT: ${AZURE_OPENAI_CHAT_DEPLOYMENT:-}
+  AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-10-21}
+  MATCH_THRESHOLD: ${MATCH_THRESHOLD:-0.80}
+
+x-api-db-url: &api-db-url postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/postgres
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  seed:
+    build: ./api
+    command: ["python", "-m", "reconlens.seed"]
+    environment:
+      <<: *azure-env
+      DATABASE_URL: *api-db-url
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: ./api
+    environment:
+      <<: *azure-env
+      DATABASE_URL: *api-db-url
+    ports:
+      - "8000:8000"
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  worker:
+    build: ./worker
+    environment:
+      DATABASE_URL: Host=db;Port=5432;Username=postgres;Password=${POSTGRES_PASSWORD:-postgres};Database=postgres
+      API_BASE_URL: http://api:8000
+      SALES_SOURCE: ${SALES_SOURCE:-csv}
+      SALES_CSV_PATH: /data/sales.csv
+      SCHEDULE_SECONDS: ${SCHEDULE_SECONDS:-300}
+      Logging__LogLevel__System.Net.Http: Warning
+      Logging__LogLevel__Polly: Warning
+      DATABRICKS_HOST: ${DATABRICKS_HOST:-}
+      DATABRICKS_TOKEN: ${DATABRICKS_TOKEN:-}
+      DATABRICKS_WAREHOUSE_ID: ${DATABRICKS_WAREHOUSE_ID:-}
+    volumes:
+      - ./data/sales.csv:/data/sales.csv:ro
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
